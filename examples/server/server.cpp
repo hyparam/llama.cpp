@@ -1,3 +1,4 @@
+#include "base64.hpp"
 #include "utils.hpp"
 
 #include "common.h"
@@ -31,6 +32,15 @@
 #include <memory>
 
 using json = nlohmann::ordered_json;
+
+// Perplexity stuff
+struct results_perplexity {
+    std::vector<llama_token> tokens;
+    double perplexity;
+    std::vector<float> logit_history;
+    std::vector<float> prob_history;
+};
+void perplexity_v3(llama_context *ctx, gpt_params &params, const std::function<bool(const std::string&, float)>& callback);
 
 bool server_verbose = false;
 bool server_log_json = true;
@@ -3702,6 +3712,35 @@ int main(int argc, char ** argv) {
         return res.set_content(root.dump(), "application/json; charset=utf-8");
     };
 
+    const auto handle_perplexity = [&ctx_server, &res_error, &params](const httplib::Request & req, httplib::Response & res) {
+        params.prompt = req.body;
+
+        // Send CSV headers and stream response
+        res.set_header("Content-Type", "text/csv");
+        // res.set_header("Transfer-Encoding", "chunked");
+        std::stringstream* csv_stream = new std::stringstream();
+
+        // Set the chunked content provider
+        res.set_chunked_content_provider("text/csv", [&, csv_stream](size_t offset, httplib::DataSink& sink) {
+            if (offset == 0) {
+                // Write the CSV header
+                *csv_stream << "token,perplexity\n";
+            }
+
+            // Compute perplexity for each token and stream the results
+            perplexity_v3(ctx_server.ctx, params, [&csv_stream, &sink](const std::string& token_base64, float prob) {
+                *csv_stream << token_base64 << "," << prob << "\n";
+                sink.write(csv_stream->str().c_str(), csv_stream->str().length());
+                csv_stream->str("");
+                return true;
+            });
+
+            sink.done();
+            delete csv_stream; // Delete the dynamically allocated std::stringstream
+            return false;
+        });
+    };
+
     auto handle_static_file = [](unsigned char * content, size_t len, const char * mime_type) {
         return [content, len, mime_type](const httplib::Request &, httplib::Response & res) {
             res.set_content(reinterpret_cast<const char*>(content), len, mime_type);
@@ -3743,6 +3782,7 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/embeddings",       handle_embeddings);
     svr->Post("/tokenize",            handle_tokenize);
     svr->Post("/detokenize",          handle_detokenize);
+    svr->Post("/perplexity",          handle_perplexity);
     if (!sparams.slot_save_path.empty()) {
         // only enable slot endpoints if slot_save_path is set
         svr->Post("/slots/:id_slot",  handle_slots_action);
@@ -3810,4 +3850,108 @@ int main(int argc, char ** argv) {
     llama_backend_free();
 
     return 0;
+}
+
+// From perplexity.cpp
+static std::vector<float> softmax(const std::vector<float>& logits) {
+    std::vector<float> probs(logits.size());
+    float max_logit = logits[0];
+    for (float v : logits) {
+        max_logit = std::max(max_logit, v);
+    }
+    double sum_exp = 0.0;
+    for (size_t i = 0; i < logits.size(); i++) {
+        // Subtract the maximum logit value from the current logit value for numerical stability
+        const float logit = logits[i] - max_logit;
+        const float exp_logit = expf(logit);
+        sum_exp += exp_logit;
+        probs[i] = exp_logit;
+    }
+    for (size_t i = 0; i < probs.size(); i++) {
+        probs[i] /= sum_exp;
+    }
+    return probs;
+}
+
+void perplexity_v3(llama_context *ctx, gpt_params &params, const std::function<bool(const std::string&, float)>& callback) {
+    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
+    std::vector<llama_token> tokens = ::llama_tokenize(ctx, params.prompt, add_bos);
+    const int n_ctx = llama_n_ctx(ctx);
+
+    if (int(tokens.size()) < 2 * n_ctx) {
+        fprintf(stderr, "%s: you need at least %d tokens to evaluate perplexity with a context of %d\n", __func__, 2 * n_ctx, n_ctx);
+        fprintf(stderr, "%s: the data file you provided tokenizes to only %zu tokens\n", __func__, tokens.size());
+        return;
+    }
+
+    std::vector<float> logit_history(tokens.size());
+    std::vector<float> prob_history(tokens.size());
+
+    if (params.ppl_stride <= 0) {
+        fprintf(stderr, "%s: stride is %d but must be greater than zero!\n", __func__, params.ppl_stride);
+        params.ppl_stride = 100;
+    }
+
+    const int calc_chunk = n_ctx;
+
+    if (int(tokens.size()) <= calc_chunk) {
+        fprintf(stderr, "%s: there are only %zu tokens, this is not enough for a context size of %d and stride %d\n", __func__, tokens.size(), n_ctx, params.ppl_stride);
+        return;
+    }
+
+    const int n_chunk_max = (tokens.size() - calc_chunk + params.ppl_stride - 1) / params.ppl_stride;
+    const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
+    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
+
+    double nll = 0.0;
+    int count = 0;
+
+    for (int i = 0; i < n_chunk; ++i) {
+        const int start = i * params.ppl_stride;
+        const int end = start + calc_chunk;
+
+        llama_kv_cache_clear(ctx);
+
+        std::vector<float> logits;
+
+        for (int j = 0; j < calc_chunk; ++j) {
+            const int batch_start = start + j;
+            const int batch_size = std::min(end - batch_start, 1);
+
+            if (j == 0 && add_bos) {
+                const auto token_org = tokens[batch_start];
+                tokens[batch_start] = llama_token_bos(llama_get_model(ctx));
+                if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, 0, 0))) {
+                    return;
+                }
+                tokens[batch_start] = token_org;
+            } else {
+                if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, 0, 0))) {
+                    return;
+                }
+            }
+
+            const auto batch_logits = llama_get_logits(ctx);
+            logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
+        }
+
+        for (int j = 0; j < calc_chunk - 1; ++j) {
+            const std::vector<float> tok_logits(logits.begin() + j * n_vocab, logits.begin() + (j + 1) * n_vocab);
+            const float prob = softmax(tok_logits)[tokens[start + j + 1]];
+            logit_history[start + j + 1] = tok_logits[tokens[start + j + 1]];
+            prob_history[start + j + 1] = prob;
+
+            // Get the token string and encode it in base64
+            const std::string token_str = llama_token_to_piece(ctx, tokens[start + j + 1]);
+            const std::string token_base64 = base64::encode(token_str);
+
+            // Stream the base64-encoded token and probability
+            if (!callback(token_base64, prob)) {
+                return;
+            }
+
+            nll += -std::log(prob);
+            ++count;
+        }
+    }
 }
